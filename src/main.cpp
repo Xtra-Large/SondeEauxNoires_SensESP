@@ -8,6 +8,8 @@
 // Remove the parts that are not relevant to you, and add your own code
 // for external hardware libraries.
 
+#include <WiFi.h>
+
 #include "sensesp/sensors/analog_input.h"
 #include "sensesp/sensors/digital_input.h"
 #include "sensesp/sensors/digital_output.h"
@@ -65,6 +67,19 @@ using namespace sensesp;
     BluetoothSerial SerialBT;
 #endif
 
+// #define MQTT_DESACTIVATED
+#if !defined(MQTT_DESACTIVATED)
+   #include <PicoMQTT.h>
+   #define MQTT_ACTIVATED
+   PicoMQTT::Server mqttServer;
+
+   #define MQTT_TOPIC_REMPLISSAGE "sonde_eaux_noires/remplissage"
+   #define MQTT_TOPIC_TOOGLE_ACTIVATION "sonde_eaux_noires/toogle"
+   #define MQTT_TOPIC_ETAT "sonde_eaux_noires/etat_pompe"
+#endif
+
+
+
 #ifdef CORE_DEBUG_LEVEL
     #if CORE_DEBUG_LEVEL > 3
         #define DEBUG_MODE
@@ -115,7 +130,7 @@ bool activateAnalogSensor =  true;
 StatusPageItem<float> remplissageReservoir{
       "Remplissage (%)", 0, "Eaux noires" , 0};
 StatusPageItem<String> pompeActivee{
-      "Pompe activéé (oui/non)", "non", "Eaux noires" , 1};
+      "Pompe activée (oui/non)", "non", "Eaux noires" , 1};
 
 float i = 0;
 float sens = 0.5;
@@ -159,6 +174,11 @@ String pauseTimePath = "/sensors/cuve_eaux_noires/pump/pause_time";
     float confMinHeightRead = 20;
     String confMinHeightReadPath = "/sensors/cuve_eaux_noires/sonar/max_height";
 #endif
+
+//gestion de la reconnexion au Wifi
+#define INTERVAL_WIFI_CHECK 300000
+long previousMillisWifiCheck = 0;
+
 
 float fakeReadSonar(){
     if(lastForcePumpStatus != forcePumpStatus){
@@ -255,6 +275,7 @@ void setup() {
         SerialBT.begin("SondesEauxNoires"); //Bluetooth device name
     #endif
   
+  WiFi.setSleep(false);
 
   // Construct the global SensESPApp() object
   SensESPAppBuilder builder;
@@ -269,7 +290,25 @@ void setup() {
                     ->enable_ota("12345678")
                     ->get_app();
 
+
   int order = 0;
+
+  #if defined(MQTT_ACTIVATED)
+      // Subscribe to a topic and attach a callback
+    mqttServer.subscribe("#", [](const char * topic, const char * payload) {
+        // payload might be binary, but PicoMQTT guarantees that it's zero-terminated
+        Serial.printf("Received message in topic '%s': %s\n", topic, payload);
+
+        if(topic == MQTT_TOPIC_TOOGLE_ACTIVATION){
+            forcePumpStatus = !forcePumpStatus;
+            #ifdef DEBUG_MODE
+                debugD("MQTT FORCE PUMP STATUS %d", forcePumpStatus);
+            #endif
+        }
+    });
+
+    mqttServer.begin();
+  #endif
   
   /**
    * TODO changer dans le constructeur du NumberConfig
@@ -301,7 +340,7 @@ void setup() {
     ->set_sort_order(100 + order++);
 
 #ifdef DEBUG_MODE
-    debugD("Starting ESP waste %dL start at %d and stop at %d and forced at %d", confVolTotal, confPercentStart, confPercentStop, confPercentStartForced);
+    debugD("Starting ESP waste %dL start at %d and stop at %d and forced at %d", inputConfVolTotal->get_value(), inputConfPercentStart->get_value(), inputConfPercentStop->get_value(), inputConfPercentStartForce->get_value());
 #endif
 
 #if ACTIVATE_SONAR == 1
@@ -337,9 +376,9 @@ void setup() {
     ->set_sort_order(400 + order++);
 
   //Hysteresys de démarrage et d'arret a partir de la sonde analogique
-  auto* hysteresisAutoStarterAnalog = new Hysteresis<float, boolean>(confPercentStop, confPercentStart, false, true);
-  auto* thresholdForcedStoperAnalog = new FloatThreshold(confPercentStop, 100, true);
-  auto* thresholdForcedStarterAnalog = new FloatThreshold(0, confPercentStartForced, false);
+  auto* hysteresisAutoStarterAnalog = new Hysteresis<float, boolean>(inputConfPercentStop->get_value(), inputConfPercentStart->get_value(), false, true);
+  auto* thresholdForcedStoperAnalog = new FloatThreshold(inputConfPercentStop->get_value(), 100, true);
+  auto* thresholdForcedStarterAnalog = new FloatThreshold(0, inputConfPercentStartForce->get_value(), false);
 
 #if ACTIVATE_ANALOG == 1
   //Capteur analogique
@@ -374,7 +413,7 @@ void setup() {
                 new SKMetadata("L",                       // No units for boolean values
                                 "Volume total de la cuve")  // Value description
             );
-    volumeTotalSKInfo->set(confVolTotal);
+    volumeTotalSKInfo->set(inputConfVolTotal->get_value());
 
     SKOutputString* tankTypeSKInfo = new SKOutputString(
                 "tanks.blackWater.analog.type",          // Signal K path
@@ -388,8 +427,8 @@ void setup() {
     MovingAverage* avgAnalog = new MovingAverage(5);
     inputAnalogSensor->connect_to(avgAnalog);
 
-    auto analogToPercentCallback = [inputAnalogSensor](float input) ->float {    
-       float returnVal = (map(input, confSensorAnalogMinVal, confSensorAnalogMaxVal, confSensorAnalogPercentFullAtMinVal, 100));
+    auto analogToPercentCallback = [inputAnalogSensor, inputConfSensorAnalogMaxVal, inputConfSensorAnalogMinVal, inputConfSensorAnalogPercentFullAtMinVal](float input) ->float {    
+       float returnVal = (map(input, inputConfSensorAnalogMinVal->get_value(), inputConfSensorAnalogMaxVal->get_value(), inputConfSensorAnalogPercentFullAtMinVal->get_value(), 100));
     
        analogValueStatusItem.set(inputAnalogSensor->get());
 
@@ -400,10 +439,15 @@ void setup() {
        }
 
        #ifdef DEBUG_MODE       
-            debugD("Analog raw %f, AVG %f, %fpercent, min %i, max %i, static %i", inputAnalogSensor->get(), input, returnVal, confSensorAnalogMinVal, confSensorAnalogMaxVal, confSensorAnalogPercentFullAtMinVal);
+            debugD("Analog raw %f, AVG %f, %fpercent, min %i, max %i, static %i", inputAnalogSensor->get(), input, returnVal, inputConfSensorAnalogMinVal->get_value(), inputConfSensorAnalogMaxVal->get_value(), inputConfSensorAnalogPercentFullAtMinVal->get_value());
        #endif
 
        remplissageReservoir.set(returnVal);
+
+       #if defined(MQTT_ACTIVATED)
+        String message = String(returnVal);
+        mqttServer.publish(MQTT_TOPIC_REMPLISSAGE, message);
+       #endif
 
        return returnVal;
     };
@@ -422,7 +466,7 @@ void setup() {
                                 "Pourcentage de remplissage de la cuve")  // Value description
                 ));
 
-    analogValToPercentTransform->connect_to(new Linear(confVolTotal, 0))
+    analogValToPercentTransform->connect_to(new Linear(inputConfVolTotal->get_value(), 0))
                 ->connect_to(new SKOutputFloat(
                 "tanks.blackWater.sonar.currentVolume",          // Signal K path
                 "/sensors/cuve_eaux_noires/analog/currentVolume",
@@ -439,9 +483,9 @@ void setup() {
 #endif
 
 //Hysteresys de démarrage et d'arret a partir du sonar
-auto* hysteresisAutoStarterSonar = new Hysteresis<float, boolean>(confPercentStop, confPercentStart, false, true);
-auto* thresholdForcedStoperSonar = new FloatThreshold(confPercentStop, 100, true);
-auto* thresholdForcedStarterSonar = new FloatThreshold(0, confPercentStartForced, false);
+auto* hysteresisAutoStarterSonar = new Hysteresis<float, boolean>(inputConfPercentStop->get_value(), inputConfPercentStart->get_value(), false, true);
+auto* thresholdForcedStoperSonar = new FloatThreshold(inputConfPercentStop->get_value(), 100, true);
+auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartForce->get_value(), false);
   
 #if ACTIVATE_SONAR == 1
   auto* sonarSensor = new RepeatSensor<float>(MILLIS_REPAT_SENSOR, readSonar);
@@ -479,7 +523,7 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, confPercentStartForced
                 new SKMetadata("L",                       // No units for boolean values
                                 "Volume total de la cuve")  // Value description
             );
-    volumeTotalSKInfo->set(confVolTotal);
+    volumeTotalSKInfo->set(inputConfVolTotal->get_value());
 
     SKOutputString* tankTypeSKInfo = new SKOutputString(
                 "tanks.blackWater.sonar.type",          // Signal K path
@@ -523,7 +567,7 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, confPercentStartForced
     };
 
     auto* sonarValToPercent = new LambdaTransform<float, int, int, float>
-            (sonarValToPercentCalbback, confMinHeightRead, confMaxHeightRead, param_data_val_to_percent);
+            (sonarValToPercentCalbback, inputConfMinHeightRead->get_value(), inputConfMaxHeightRead->get_value(), param_data_val_to_percent);
     
     sonarSensor->connect_to(sonarValToPercent);
 
@@ -534,7 +578,7 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, confPercentStartForced
                                 "Pourcentage de remplissage de la cuve")  // Value description
                 ));
 
-    sonarValToPercent->connect_to(new Linear(1/100*confVolTotal, 0))
+    sonarValToPercent->connect_to(new Linear(1/100*inputConfVolTotal->get_value(), 0))
                 ->connect_to(new SKOutputInt(
                 "tanks.blackWater.sonar.currentVolume",          // Signal K path
                 "/sensors/cuve_eaux_noires/sonar/currentVolume",
@@ -566,7 +610,7 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, confPercentStartForced
                                 "Pourcentage d'espace libre de la cuve")  // Value description
                 ));
     
-    sonarValToPercent->connect_to(new Linear(1/100*confVolTotal, 0))
+    sonarValToPercent->connect_to(new Linear(1/100*inputConfVolTotal->get_value(), 0))
                 ->connect_to(new SKOutputInt(
                 "sensors.cuve_eaux_noires.sonar.liters_inside",          // Signal K path
                 "/sensors/cuve_eaux_noires/sonar/liters_inside",
@@ -575,7 +619,7 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, confPercentStartForced
                 ));
 
     sonarValToPercent->connect_to(new Linear(-1, +100))
-                ->connect_to(new Linear(1/100*confVolTotal, 0))
+                ->connect_to(new Linear(1/100*inputConfVolTotal->get_value(), 0))
                 ->connect_to(new SKOutputInt(
                 "sensors.cuve_eaux_noires.sonar.liters_free",          // Signal K path
                 "/sensors/cuve_eaux_noires/sonar/liters_free",
@@ -634,13 +678,13 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, confPercentStartForced
     });
 
   //Web UI marche forcee
-//   auto* webUIMarcheForceButton = UIButton::add("ForcePump", "Force pompe", false); 
-//   webUIMarcheForceButton->attach([](){
-//         forcePumpStatus = !forcePumpStatus;
-//         #ifdef DEBUG_MODE
-//             debugD("WEB UI FORCE PUMP STATUS %d", forcePumpStatus);
-//         #endif
-//   });
+  auto* webUIMarcheForceButton = UIButton::add("ForcePump", "Force pompe", false); 
+  webUIMarcheForceButton->attach([](){
+        forcePumpStatus = !forcePumpStatus;
+        #ifdef DEBUG_MODE
+            debugD("WEB UI FORCE PUMP STATUS %d", forcePumpStatus);
+        #endif
+  });
 
 
   //Relais d'activation
@@ -657,7 +701,7 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, confPercentStartForced
   //    hysteresisAutoStarter  -> si true, on active
   //    OU thresholdForcedStoper ET (digitalMarcheForceDebounced OU signalKMarcheForce OU webUIMarcheForce) - > Si true, alors on active
   //Trasformation de la lecture du reservoir en pourcentage de remplissage
-  auto isActivateRelais = [sonarSensor, inputAnalogSensor, hysteresisAutoStarterSonar, thresholdForcedStoperSonar, hysteresisAutoStarterAnalog, thresholdForcedStoperAnalog, digitalMarcheForce, thresholdForcedStarterSonar, thresholdForcedStarterAnalog](float input) ->bool {    
+  auto isActivateRelais = [sonarSensor, inputAnalogSensor, hysteresisAutoStarterSonar, thresholdForcedStoperSonar, hysteresisAutoStarterAnalog, thresholdForcedStoperAnalog, digitalMarcheForce, thresholdForcedStarterSonar, thresholdForcedStarterAnalog, inputMaxTimeContinius, inputPauseTime](float input) ->bool {    
     bool pumpActivated = forcePumpStatus;
 
     #if ACTIVATE_SONAR == 1
@@ -751,47 +795,67 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, confPercentStartForced
         if(thresholdForcedStarterSonar->get() || thresholdForcedStarterAnalog->get()){
             //le niveau est très haut, on force le fonctionnement
              #ifdef DEBUG_MODE
-                debugD("NIVEAU TRES HAUT, ON FORCE - SECU TIMER %d ms [< MAX %d]", (millis() - pumpStartTime), (maxTimeContinius*1000*60));
+                debugD("NIVEAU TRES HAUT, ON FORCE - SECU TIMER %d ms [< MAX %d]", (millis() - pumpStartTime), (inputMaxTimeContinius->get_value()*1000*60));
 
                 #ifdef BT_ACTIVATED
-                    SerialBT.printf("[DEBUG] NIVEAU TRES HAUT, ON FORCE - SECU TIMER %d ms [< MAX %d]", (millis() - pumpStartTime), (maxTimeContinius*1000*60));
+                    SerialBT.printf("[DEBUG] NIVEAU TRES HAUT, ON FORCE - SECU TIMER %d ms [< MAX %d]", (millis() - pumpStartTime), (inputMaxTimeContinius->get_value()*1000*60));
                 #endif
             #endif
 
             pompeActivee.set("oui");
+
+            #if defined(MQTT_ACTIVATED)
+                mqttServer.publish(MQTT_TOPIC_ETAT, "oui");
+            #endif
+            
             pumpStopSecuTime=0;
             return true;
-        }else if((millis() - pumpStartTime) > (maxTimeContinius*1000*60)){
+        }else if((millis() - pumpStartTime) > (inputMaxTimeContinius->get_value()*1000*60)){
             if(pumpStopSecuTime == 0){
                 pumpStopSecuTime =  millis();
-            }else if((millis() - pumpStopSecuTime) > (pauseTime*1000*60)){
+            }else if((millis() - pumpStopSecuTime) > (inputPauseTime->get_value()*1000*60)){
                 pumpStartTime = 0;
                 pumpStopSecuTime = 0;
             }
 
              #ifdef DEBUG_MODE
-                debugD("SECU TIMER %d ms [> MAX %d] SECU TIMER %d [MAX %d]", (millis() - pumpStartTime), (maxTimeContinius*1000*60), (millis() - pumpStopSecuTime),  (pauseTime*1000*60));
+                debugD("SECU TIMER %d ms [> MAX %d] SECU TIMER %d [MAX %d]", (millis() - pumpStartTime), (inputMaxTimeContinius->get_value()*1000*60), (millis() - pumpStopSecuTime),  (inputPauseTime->get_value()*1000*60));
                 
                 #ifdef BT_ACTIVATED
-                    SerialBT.printf("[DEBUG] SECU TIMER %d ms [> MAX %d] SECU TIMER %d [MAX %d]", (millis() - pumpStartTime), (maxTimeContinius*1000*60), (millis() - pumpStopSecuTime),  (pauseTime*1000*60));
+                    SerialBT.printf("[DEBUG] SECU TIMER %d ms [> MAX %d] SECU TIMER %d [MAX %d]", (millis() - pumpStartTime), (inputMaxTimeContinius->get_value()*1000*60), (millis() - pumpStopSecuTime),  (inputPauseTime->get_value()*1000*60));
                 #endif
             #endif
+
+            #if defined(MQTT_ACTIVATED)
+                mqttServer.publish(MQTT_TOPIC_ETAT, "non");
+            #endif
+
             pompeActivee.set("non");
             return false; //On est en mode durée de sécurité
         }else{
              #ifdef DEBUG_MODE
-                debugD("SECU TIMER %d ms [< MAX %d]", (millis() - pumpStartTime), (maxTimeContinius*1000*60));
+                debugD("SECU TIMER %d ms [< MAX %d]", (millis() - pumpStartTime), (inputMaxTimeContinius->get_value()*1000*60));
 
                 #ifdef BT_ACTIVATED
-                    SerialBT.printf("[DEBUG] SECU TIMER %d ms [< MAX %d]", (millis() - pumpStartTime), (maxTimeContinius*1000*60));
+                    SerialBT.printf("[DEBUG] SECU TIMER %d ms [< MAX %d]", (millis() - pumpStartTime), (inputMaxTimeContinius->get_value()*1000*60));
                 #endif
             #endif
+
+            #if defined(MQTT_ACTIVATED)
+                mqttServer.publish(MQTT_TOPIC_ETAT, "oui");
+            #endif
+
             pompeActivee.set("oui");
             return true;
         }
     }else{
         pumpStartTime = 0;
         pumpStopSecuTime = 0;
+
+        #if defined(MQTT_ACTIVATED)
+            mqttServer.publish(MQTT_TOPIC_ETAT, "non");
+        #endif
+
         pompeActivee.set("non");
         return false;
     }
@@ -813,4 +877,18 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, confPercentStartForced
 
 void loop() {
     event_loop()->tick(); 
+
+    #if defined(MQTT_ACTIVATED)
+        mqttServer.loop();
+    #endif
+
+    unsigned long currentMillis = millis();
+    if ((WiFi.status() != WL_CONNECTED) && (currentMillis - previousMillisWifiCheck >=INTERVAL_WIFI_CHECK)) {
+        Serial.print(millis());
+        Serial.println("Reconnecting to WiFi...");
+        WiFi.disconnect();
+        WiFi.scanNetworks();
+        WiFi.reconnect();
+        previousMillisWifiCheck = currentMillis;
+    }
 }
