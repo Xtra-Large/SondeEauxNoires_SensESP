@@ -75,11 +75,18 @@ using namespace sensesp;
 
    #define MQTT_TOPIC_REMPLISSAGE "sonde_eaux_noires/remplissage"
    #define MQTT_TOPIC_TOOGLE_ACTIVATION "sonde_eaux_noires/toogle"
-   #define MQTT_TOPIC_ETAT "sonde_eaux_noires/etat_pompe"
+   #define MQTT_TOPIC_ETAT_PUMP "sonde_eaux_noires/etat_pompe"
+
+   #define MQTT_DEBUG
+   #if defined(MQTT_DEBUG)
+        #define MQTT_TOPIC_RECEIVED "sonde_eaux_noires/topic_received"
+        #define MQTT_TOPIC_REMPLISSAGE_MIN "sonde_eaux_noires/remplissage_min"
+        #define MQTT_TOPIC_REMPLISSAGE_MAX "sonde_eaux_noires/remplissage_max"
+        #define MQTT_TOPIC_ETAT_PUMP_FORCED "sonde_eaux_noires/etat_force_pompe"
+        #define MQTT_TOPIC_MODE_AUTO "sonde_eaux_noires/mode_auto"
+        #define MQTT_TOPIC_MODE_FORCE "sonde_eaux_noires/mode_force"
+    #endif
 #endif
-
-
-
 #ifdef CORE_DEBUG_LEVEL
     #if CORE_DEBUG_LEVEL > 3
         #define DEBUG_MODE
@@ -113,11 +120,14 @@ int SONAR_MODE = 1;
 #define SEND_SK_ANALOG_EXT_INFO true
 
 
-//Gestion des états d'activation en marche forcée
+//Gestion des états d'activation en marche forcée via le bouton physqiue
 bool forcePumpStatus = false;
 
 //Gestion des états d'activation en mode automatique
 bool autoPumpStatus = false;
+
+//Marche force via les interfaces
+bool forcePumpStatusUX = false;
 
 //gestion des times de securité
 long pumpStartTime = 0;
@@ -295,16 +305,23 @@ void setup() {
 
   #if defined(MQTT_ACTIVATED)
       // Subscribe to a topic and attach a callback
+    mqttServer.subscribe(MQTT_TOPIC_TOOGLE_ACTIVATION, [](const char * payload) { 
+        forcePumpStatusUX = !forcePumpStatusUX;
+        #ifdef DEBUG_MODE
+            debugD("MQTT FORCE PUMP STATUS %d", forcePumpStatusUX);
+        #endif
+
+        #if defined(MQTT_DEBUG)
+            mqttServer.publish(MQTT_TOPIC_RECEIVED, "TOOGLE PUMP STATUS");
+        #endif
+    });
     mqttServer.subscribe("#", [](const char * topic, const char * payload) {
         // payload might be binary, but PicoMQTT guarantees that it's zero-terminated
         Serial.printf("Received message in topic '%s': %s\n", topic, payload);
 
-        if(topic == MQTT_TOPIC_TOOGLE_ACTIVATION){
-            forcePumpStatus = !forcePumpStatus;
-            #ifdef DEBUG_MODE
-                debugD("MQTT FORCE PUMP STATUS %d", forcePumpStatus);
-            #endif
-        }
+        #if defined(MQTT_DEBUG)
+            mqttServer.publish(MQTT_TOPIC_RECEIVED, topic);
+        #endif
     });
 
     mqttServer.begin();
@@ -427,7 +444,7 @@ void setup() {
     MovingAverage* avgAnalog = new MovingAverage(5);
     inputAnalogSensor->connect_to(avgAnalog);
 
-    auto analogToPercentCallback = [inputAnalogSensor, inputConfSensorAnalogMaxVal, inputConfSensorAnalogMinVal, inputConfSensorAnalogPercentFullAtMinVal](float input) ->float {    
+    auto analogToPercentCallback = [inputAnalogSensor, inputConfSensorAnalogMaxVal, inputConfSensorAnalogMinVal, inputConfSensorAnalogPercentFullAtMinVal, inputConfPercentStart, inputConfPercentStop](float input) ->float {    
        float returnVal = (map(input, inputConfSensorAnalogMinVal->get_value(), inputConfSensorAnalogMaxVal->get_value(), inputConfSensorAnalogPercentFullAtMinVal->get_value(), 100));
     
        analogValueStatusItem.set(inputAnalogSensor->get());
@@ -447,6 +464,12 @@ void setup() {
        #if defined(MQTT_ACTIVATED)
         String message = String(returnVal);
         mqttServer.publish(MQTT_TOPIC_REMPLISSAGE, message);
+        #if defined(MQTT_DEBUG)
+            message = String(inputConfPercentStop->get_value());
+            mqttServer.publish(MQTT_TOPIC_REMPLISSAGE_MIN, message);
+            message = String(inputConfPercentStart->get_value());
+            mqttServer.publish(MQTT_TOPIC_REMPLISSAGE_MAX, message);
+        #endif
        #endif
 
        return returnVal;
@@ -680,9 +703,9 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartF
   //Web UI marche forcee
   auto* webUIMarcheForceButton = UIButton::add("ForcePump", "Force pompe", false); 
   webUIMarcheForceButton->attach([](){
-        forcePumpStatus = !forcePumpStatus;
+        forcePumpStatusUX = !forcePumpStatusUX;
         #ifdef DEBUG_MODE
-            debugD("WEB UI FORCE PUMP STATUS %d", forcePumpStatus);
+            debugD("WEB UI FORCE PUMP STATUS %d", forcePumpStatusUX);
         #endif
   });
 
@@ -702,7 +725,7 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartF
   //    OU thresholdForcedStoper ET (digitalMarcheForceDebounced OU signalKMarcheForce OU webUIMarcheForce) - > Si true, alors on active
   //Trasformation de la lecture du reservoir en pourcentage de remplissage
   auto isActivateRelais = [sonarSensor, inputAnalogSensor, hysteresisAutoStarterSonar, thresholdForcedStoperSonar, hysteresisAutoStarterAnalog, thresholdForcedStoperAnalog, digitalMarcheForce, thresholdForcedStarterSonar, thresholdForcedStarterAnalog, inputMaxTimeContinius, inputPauseTime](float input) ->bool {    
-    bool pumpActivated = forcePumpStatus;
+    bool pumpActivated = forcePumpStatus || forcePumpStatusUX;
 
     #if ACTIVATE_SONAR == 1
     if(activateSonarSensor && thresholdForcedStoperSonar->get() 
@@ -787,13 +810,24 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartF
         #endif
     }
 
+    #if defined(MQTT_DEBUG)
+        String message = String(forcePumpStatusUX ? "oui" : "non");
+        mqttServer.publish(MQTT_TOPIC_ETAT_PUMP_FORCED, message);
+
+        message = String(forcePumpStatus ? "oui" : "non");
+        mqttServer.publish(MQTT_TOPIC_MODE_FORCE, message);
+
+        message = String(autoPumpStatus ? "oui" : "non");
+        mqttServer.publish(MQTT_TOPIC_MODE_AUTO, message);
+    #endif
+
     //gestion des timers de sécurité
     if(pumpActivated){
         if(pumpStartTime == 0){
             pumpStartTime =  millis();
         }
         if(thresholdForcedStarterSonar->get() || thresholdForcedStarterAnalog->get()){
-            //le niveau est très haut, on force le fonctionnement
+            //le niveau est très haut, on force le fonctionnement quelque soit le timer
              #ifdef DEBUG_MODE
                 debugD("NIVEAU TRES HAUT, ON FORCE - SECU TIMER %d ms [< MAX %d]", (millis() - pumpStartTime), (inputMaxTimeContinius->get_value()*1000*60));
 
@@ -805,7 +839,7 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartF
             pompeActivee.set("oui");
 
             #if defined(MQTT_ACTIVATED)
-                mqttServer.publish(MQTT_TOPIC_ETAT, "oui");
+                mqttServer.publish(MQTT_TOPIC_ETAT_PUMP, "oui");
             #endif
             
             pumpStopSecuTime=0;
@@ -827,7 +861,7 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartF
             #endif
 
             #if defined(MQTT_ACTIVATED)
-                mqttServer.publish(MQTT_TOPIC_ETAT, "non");
+                mqttServer.publish(MQTT_TOPIC_ETAT_PUMP, "non");
             #endif
 
             pompeActivee.set("non");
@@ -842,7 +876,7 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartF
             #endif
 
             #if defined(MQTT_ACTIVATED)
-                mqttServer.publish(MQTT_TOPIC_ETAT, "oui");
+                mqttServer.publish(MQTT_TOPIC_ETAT_PUMP, "oui");
             #endif
 
             pompeActivee.set("oui");
@@ -853,13 +887,12 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartF
         pumpStopSecuTime = 0;
 
         #if defined(MQTT_ACTIVATED)
-            mqttServer.publish(MQTT_TOPIC_ETAT, "non");
+            mqttServer.publish(MQTT_TOPIC_ETAT_PUMP, "non");
         #endif
 
         pompeActivee.set("non");
         return false;
     }
-
   };
 
   const ParamInfo* param_data_activate_relais = new ParamInfo[0]{
