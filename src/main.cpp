@@ -71,13 +71,22 @@ using namespace sensesp;
 #if !defined(MQTT_DESACTIVATED)
    #include <PicoMQTT.h>
    #define MQTT_ACTIVATED
+   #define MQTT_REMPLISSAGE_DEADBAND 2 //On laisse 2% de marge avant de renvoyer un message
+   float lastSendRemplissage = 0.0;
    PicoMQTT::Server mqttServer;
+   PicoMQTT::Client mqtt(
+        "192.168.5.5",    // broker address (or IP)
+        1883,                   // broker port (defaults to 1883)
+        "sondeEauxNoires",           // Client ID
+        "mqtt-user",             // MQTT username
+        "deweertricault"              // MQTT password
+    );
 
    #define MQTT_TOPIC_REMPLISSAGE "sonde_eaux_noires/remplissage"
    #define MQTT_TOPIC_TOOGLE_ACTIVATION "sonde_eaux_noires/toogle"
    #define MQTT_TOPIC_ETAT_PUMP "sonde_eaux_noires/etat_pompe"
 
-   #define MQTT_DEBUG
+   //#define MQTT_DEBUG
    #if defined(MQTT_DEBUG)
         #define MQTT_TOPIC_RECEIVED "sonde_eaux_noires/topic_received"
         #define MQTT_TOPIC_REMPLISSAGE_MIN "sonde_eaux_noires/remplissage_min"
@@ -87,6 +96,54 @@ using namespace sensesp;
         #define MQTT_TOPIC_MODE_FORCE "sonde_eaux_noires/mode_force"
     #endif
 #endif
+
+#define DTH11_ACTIVATED
+#ifdef DTH11_ACTIVATED
+    #include <DHTStable.h>
+
+    bool activateTempHumSensor =  true;
+    DHTStable DHT;
+    #define DHT11_PIN       4
+    float lastSendTemp = 0.0;
+    float lastSendHumidity = 0.0;
+
+    StatusPageItem<float> temperaturePiece{
+      "Temperature pièce", 0, "Eaux noires" , 0};
+
+    #if !defined(MQTT_DESACTIVATED)
+        #define MQTT_TOPIC_TEMP "sonde_eaux_noires/temperature"
+        #define MQTT_TOPIC_HUMIDITY "sonde_eaux_noires/humidity"
+    #endif
+    float read_temp_callback() { 
+        if(activateTempHumSensor){
+            int chk = DHT.read11(DHT11_PIN);
+            if(chk == DHTLIB_OK){
+                #if defined(MQTT_ACTIVATED)
+                    mqtt.publish(MQTT_TOPIC_TEMP, String(DHT.getTemperature()));
+                    mqttServer.publish(MQTT_TOPIC_TEMP, String(DHT.getTemperature()));
+                #endif 
+                temperaturePiece.set(DHT.getTemperature());
+                return (DHT.getTemperature());
+            }
+        }
+        return 999.0f; 
+    }
+    float read_humidity_callback() {
+        if(activateTempHumSensor){
+            int chk = DHT.read11(DHT11_PIN);
+            if(chk == DHTLIB_OK){
+                #if defined(MQTT_ACTIVATED)
+                    mqtt.publish(MQTT_TOPIC_HUMIDITY, String(DHT.getHumidity()));
+                    mqttServer.publish(MQTT_TOPIC_HUMIDITY, String(DHT.getHumidity()));
+                #endif
+                return (DHT.getHumidity());
+            }
+        }
+        return -1.0f;
+    }
+#endif
+
+
 #ifdef CORE_DEBUG_LEVEL
     #if CORE_DEBUG_LEVEL > 3
         #define DEBUG_MODE
@@ -271,6 +328,7 @@ bool fakeSensorRepeat(){
     return true;
 }
 
+
 // The setup function performs one-time application initialization.
 void setup() {
   //On commence par mettre le PIN d'activation de la pompe à LOW pour ne pas qu'elle s'allume au démarrage
@@ -296,37 +354,84 @@ void setup() {
                     // Optionally, hard-code the WiFi and Signal K server
                     // settings. This is normally not needed.
                     //->set_wifi("My WiFi SSID", "my_wifi_password")
-                    //->set_sk_server("192.168.10.3", 80)
+                    ->set_sk_server("192.168.5.5", 3000)
                     ->enable_ota("12345678")
                     ->get_app();
 
+  // Get the WebSocket client to configure SSL settings.
+  auto ws_client = sensesp_app->get_ws_client();
+  ws_client->set_ssl_enabled(false);
+
+//   auto auth_handler = sensesp_app->get_auth_handler();
+//   if (auth_handler != nullptr) {
+//     auth_handler->clear_auth_data();
+//   }
+
+  sensesp_app->start();
 
   int order = 0;
 
   #if defined(MQTT_ACTIVATED)
       // Subscribe to a topic and attach a callback
-    mqttServer.subscribe(MQTT_TOPIC_TOOGLE_ACTIVATION, [](const char * payload) { 
+    mqtt.subscribe(MQTT_TOPIC_TOOGLE_ACTIVATION, [](const char * payload) { 
         forcePumpStatusUX = !forcePumpStatusUX;
         #ifdef DEBUG_MODE
             debugD("MQTT FORCE PUMP STATUS %d", forcePumpStatusUX);
         #endif
 
         #if defined(MQTT_DEBUG)
+            mqtt.publish(MQTT_TOPIC_RECEIVED, "TOOGLE PUMP STATUS");
             mqttServer.publish(MQTT_TOPIC_RECEIVED, "TOOGLE PUMP STATUS");
         #endif
     });
-    mqttServer.subscribe("#", [](const char * topic, const char * payload) {
+    mqtt.subscribe("#", [](const char * topic, const char * payload) {
         // payload might be binary, but PicoMQTT guarantees that it's zero-terminated
         Serial.printf("Received message in topic '%s': %s\n", topic, payload);
 
         #if defined(MQTT_DEBUG)
+            mqtt.publish(MQTT_TOPIC_RECEIVED, topic);
             mqttServer.publish(MQTT_TOPIC_RECEIVED, topic);
         #endif
     });
 
+    mqtt.begin();
     mqttServer.begin();
   #endif
   
+    #ifdef DTH11_ACTIVATED
+        CheckboxConfig* chkActivateTempHumSensor = new CheckboxConfig(true, "Activation du capteur de temperature/Humidite", "/sensors/cuve_eaux_noires/activate_temp_humidity");
+        ConfigItem(chkActivateTempHumSensor)
+            ->set_title("Sonde")
+            ->set_sort_order(500 + order++);
+
+        activateAnalogSensor = chkActivateTempHumSensor->get_value();
+
+
+        auto* sondeEauxNoiresRoomTemp =
+            new RepeatSensor<float>(60000, read_temp_callback);
+
+        auto* sondeEauxNoiresRoomHumidity =
+            new RepeatSensor<float>(60000, read_humidity_callback);
+
+
+        sondeEauxNoiresRoomTemp->connect_to(new SKOutputFloat(
+                "tanks.blackWater.room.temperature",          // Signal K path
+                "/sensors/cuve_eaux_noires/room/temps",
+                new SKMetadata("deg",                       // No units for boolean values
+                                "Temperature de la piece de la cuve à eaux noires")  // Value description
+                ));
+        
+        sondeEauxNoiresRoomHumidity->connect_to(new SKOutputFloat(
+                "tanks.blackWater.room.humidity",          // Signal K path
+                "/sensors/cuve_eaux_noires/room/humidity",
+                new SKMetadata("ratio",                       // No units for boolean values
+                                "Taux d'humidite de la piece de la cuve à eaux noires")  // Value description
+                ));
+
+
+    #endif
+
+
   /**
    * TODO changer dans le constructeur du NumberConfig
    * pour virer les références aux pointeurs
@@ -441,7 +546,7 @@ void setup() {
     tankTypeSKInfo->set("holding");
 
     // Takes a moving average for every 10 values, with scale factor
-    MovingAverage* avgAnalog = new MovingAverage(5);
+    MovingAverage* avgAnalog = new MovingAverage(10);
     inputAnalogSensor->connect_to(avgAnalog);
 
     auto analogToPercentCallback = [inputAnalogSensor, inputConfSensorAnalogMaxVal, inputConfSensorAnalogMinVal, inputConfSensorAnalogPercentFullAtMinVal, inputConfPercentStart, inputConfPercentStop](float input) ->float {    
@@ -459,18 +564,24 @@ void setup() {
             debugD("Analog raw %f, AVG %f, %fpercent, min %i, max %i, static %i", inputAnalogSensor->get(), input, returnVal, inputConfSensorAnalogMinVal->get_value(), inputConfSensorAnalogMaxVal->get_value(), inputConfSensorAnalogPercentFullAtMinVal->get_value());
        #endif
 
-       remplissageReservoir.set(returnVal);
-
        #if defined(MQTT_ACTIVATED)
-        String message = String(returnVal);
-        mqttServer.publish(MQTT_TOPIC_REMPLISSAGE, message);
-        #if defined(MQTT_DEBUG)
-            message = String(inputConfPercentStop->get_value());
-            mqttServer.publish(MQTT_TOPIC_REMPLISSAGE_MIN, message);
-            message = String(inputConfPercentStart->get_value());
-            mqttServer.publish(MQTT_TOPIC_REMPLISSAGE_MAX, message);
-        #endif
+        if(abs(returnVal -  lastSendRemplissage) >= MQTT_REMPLISSAGE_DEADBAND){
+            String message = String(returnVal);
+            mqtt.publish(MQTT_TOPIC_REMPLISSAGE, message);
+            mqttServer.publish(MQTT_TOPIC_REMPLISSAGE, message);
+            #if defined(MQTT_DEBUG)
+                message = String(inputConfPercentStop->get_value());
+                mqtt.publish(MQTT_TOPIC_REMPLISSAGE_MIN, message);
+                mqttServer.publish(MQTT_TOPIC_REMPLISSAGE_MIN, message);
+                message = String(inputConfPercentStart->get_value());
+                mqtt.publish(MQTT_TOPIC_REMPLISSAGE_MAX, message);
+                mqttServer.publish(MQTT_TOPIC_REMPLISSAGE_MAX, message);
+            #endif
+            lastSendRemplissage = returnVal;
+        }
        #endif
+
+       remplissageReservoir.set(returnVal);
 
        return returnVal;
     };
@@ -482,19 +593,20 @@ void setup() {
 
     avgAnalog->connect_to(analogValToPercentTransform);
 
-    analogValToPercentTransform->connect_to(new SKOutputFloat(
+    analogValToPercentTransform->connect_to(new Linear(1/100, 0))
+                ->connect_to(new SKOutputFloat(
                 "tanks.blackWater.sonar.currentLevel",          // Signal K path
                 "/sensors/cuve_eaux_noires/analog/currentLevel",
-                new SKMetadata("%",                       // No units for boolean values
+                new SKMetadata("ratio",                       // No units for boolean values
                                 "Pourcentage de remplissage de la cuve")  // Value description
                 ));
 
-    analogValToPercentTransform->connect_to(new Linear(inputConfVolTotal->get_value(), 0))
+    analogValToPercentTransform->connect_to(new Linear(inputConfVolTotal->get_value()/100/1000, 0))
                 ->connect_to(new SKOutputFloat(
                 "tanks.blackWater.sonar.currentVolume",          // Signal K path
                 "/sensors/cuve_eaux_noires/analog/currentVolume",
-                new SKMetadata("L",                       // No units for boolean values
-                                "Nombre de litres dans la cuve")  // Value description
+                new SKMetadata("m3",                       // No units for boolean values
+                                "Nombre de m3 dans la cuve")  // Value description
                 ));
 
     analogValToPercentTransform->connect_to(hysteresisAutoStarterAnalog);
@@ -713,7 +825,7 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartF
   //Relais d'activation
   auto* relais = new DigitalOutput(PIN_RELAY);
   relais->connect_to(new SKOutputBool(
-              "tanks.blackWater.0.pumpState",          // Signal K path
+              "tanks.blackWater.pumpState",          // Signal K path
               new SKMetadata("ON/OFF",                       // No units for boolean values
                             "Pompe en fonctionnement")  // Value description
               ));
@@ -812,12 +924,15 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartF
 
     #if defined(MQTT_DEBUG)
         String message = String(forcePumpStatusUX ? "oui" : "non");
+        mqtt.publish(MQTT_TOPIC_ETAT_PUMP_FORCED, message);
         mqttServer.publish(MQTT_TOPIC_ETAT_PUMP_FORCED, message);
 
         message = String(forcePumpStatus ? "oui" : "non");
+        mqtt.publish(MQTT_TOPIC_MODE_FORCE, message);
         mqttServer.publish(MQTT_TOPIC_MODE_FORCE, message);
 
         message = String(autoPumpStatus ? "oui" : "non");
+        mqtt.publish(MQTT_TOPIC_MODE_AUTO, message);
         mqttServer.publish(MQTT_TOPIC_MODE_AUTO, message);
     #endif
 
@@ -839,7 +954,8 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartF
             pompeActivee.set("oui");
 
             #if defined(MQTT_ACTIVATED)
-                mqttServer.publish(MQTT_TOPIC_ETAT_PUMP, "oui");
+                mqtt.publish(MQTT_TOPIC_ETAT_PUMP, "1");
+                mqttServer.publish(MQTT_TOPIC_ETAT_PUMP, "1");
             #endif
             
             pumpStopSecuTime=0;
@@ -861,7 +977,8 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartF
             #endif
 
             #if defined(MQTT_ACTIVATED)
-                mqttServer.publish(MQTT_TOPIC_ETAT_PUMP, "non");
+                mqtt.publish(MQTT_TOPIC_ETAT_PUMP, "0");
+                mqttServer.publish(MQTT_TOPIC_ETAT_PUMP, "0");
             #endif
 
             pompeActivee.set("non");
@@ -876,7 +993,8 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartF
             #endif
 
             #if defined(MQTT_ACTIVATED)
-                mqttServer.publish(MQTT_TOPIC_ETAT_PUMP, "oui");
+                mqtt.publish(MQTT_TOPIC_ETAT_PUMP, "1");
+                mqttServer.publish(MQTT_TOPIC_ETAT_PUMP, "1");
             #endif
 
             pompeActivee.set("oui");
@@ -887,7 +1005,8 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartF
         pumpStopSecuTime = 0;
 
         #if defined(MQTT_ACTIVATED)
-            mqttServer.publish(MQTT_TOPIC_ETAT_PUMP, "non");
+            mqtt.publish(MQTT_TOPIC_ETAT_PUMP, "0");
+            mqttServer.publish(MQTT_TOPIC_ETAT_PUMP, "0");
         #endif
 
         pompeActivee.set("non");
@@ -912,6 +1031,7 @@ void loop() {
     event_loop()->tick(); 
 
     #if defined(MQTT_ACTIVATED)
+        mqtt.loop();
         mqttServer.loop();
     #endif
 
