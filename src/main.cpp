@@ -18,7 +18,7 @@
 #include "sensesp/sensors/analog_input.h"
 #include "sensesp/transforms/moving_average.h"
 #include "sensesp/signalk/signalk_output.h"
-#include "sensesp/signalk/signalk_value_listener.h"
+#include "sensesp/signalk/signalk_put_request_listener.h"
 #include "sensesp/system/lambda_consumer.h"
 #include "sensesp/transforms/hysteresis.h"
 #include "sensesp/transforms/threshold.h"
@@ -130,14 +130,7 @@ using namespace sensesp;
     }
     float read_humidity_callback() {
         if(activateTempHumSensor){
-            int chk = DHT.read11(DHT11_PIN);
-            if(chk == DHTLIB_OK){
-                #if defined(MQTT_ACTIVATED)
-                    mqtt.publish(MQTT_TOPIC_HUMIDITY, String(DHT.getHumidity()));
-                    mqttServer.publish(MQTT_TOPIC_HUMIDITY, String(DHT.getHumidity()));
-                #endif
-                return (DHT.getHumidity());
-            }
+            return (DHT.getHumidity()/100);
         }
         return -1.0f;
     }
@@ -428,7 +421,6 @@ void setup() {
                                 "Taux d'humidite de la piece de la cuve à eaux noires")  // Value description
                 ));
 
-
     #endif
 
 
@@ -565,10 +557,9 @@ void setup() {
        #endif
 
        #if defined(MQTT_ACTIVATED)
-        if(abs(returnVal -  lastSendRemplissage) >= MQTT_REMPLISSAGE_DEADBAND){
-            String message = String(returnVal);
+        String message = String(returnVal);
+        if(abs(returnVal -  lastSendRemplissage) >= MQTT_REMPLISSAGE_DEADBAND || pompeActivee.get() == "oui"){
             mqtt.publish(MQTT_TOPIC_REMPLISSAGE, message);
-            mqttServer.publish(MQTT_TOPIC_REMPLISSAGE, message);
             #if defined(MQTT_DEBUG)
                 message = String(inputConfPercentStop->get_value());
                 mqtt.publish(MQTT_TOPIC_REMPLISSAGE_MIN, message);
@@ -579,6 +570,7 @@ void setup() {
             #endif
             lastSendRemplissage = returnVal;
         }
+        mqttServer.publish(MQTT_TOPIC_REMPLISSAGE, message);
        #endif
 
        remplissageReservoir.set(returnVal);
@@ -593,17 +585,17 @@ void setup() {
 
     avgAnalog->connect_to(analogValToPercentTransform);
 
-    analogValToPercentTransform->connect_to(new Linear(1/100, 0))
+    analogValToPercentTransform->connect_to(new Linear(0.01, 0))
                 ->connect_to(new SKOutputFloat(
-                "tanks.blackWater.sonar.currentLevel",          // Signal K path
+                "tanks.blackWater.analog.currentLevel",          // Signal K path
                 "/sensors/cuve_eaux_noires/analog/currentLevel",
                 new SKMetadata("ratio",                       // No units for boolean values
                                 "Pourcentage de remplissage de la cuve")  // Value description
                 ));
 
-    analogValToPercentTransform->connect_to(new Linear(inputConfVolTotal->get_value()/100/1000, 0))
+    analogValToPercentTransform->connect_to(new Linear(inputConfVolTotal->get_value()/100.0/1000.0, 0))
                 ->connect_to(new SKOutputFloat(
-                "tanks.blackWater.sonar.currentVolume",          // Signal K path
+                "tanks.blackWater.analog.currentVolume",          // Signal K path
                 "/sensors/cuve_eaux_noires/analog/currentVolume",
                 new SKMetadata("m3",                       // No units for boolean values
                                 "Nombre de m3 dans la cuve")  // Value description
@@ -706,10 +698,11 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartF
     
     sonarSensor->connect_to(sonarValToPercent);
 
-    sonarValToPercent->connect_to(new SKOutputInt(
+    sonarValToPercent->connect_to(new Linear(0.01, 0))
+                ->connect_to(new SKOutputFloat(
                 "tanks.blackWater.sonar.currentLevel",          // Signal K path
                 "/sensors/cuve_eaux_noires/sonar/currentLevel",
-                new SKMetadata("%",                       // No units for boolean values
+                new SKMetadata("ratio",                       // No units for boolean values
                                 "Pourcentage de remplissage de la cuve")  // Value description
                 ));
 
@@ -802,14 +795,15 @@ auto* thresholdForcedStarterSonar = new FloatThreshold(0, inputConfPercentStartF
   });
 
 
-  //SignalK marche forcée
-  auto* signalKMarcheForce =
-      new BoolSKListener("sensors.cuve_eaux_noires.pump.force_on_sk");
-    signalKMarcheForce->attach([](){
-                forcePumpStatus = !forcePumpStatus;
-                #ifdef DEBUG_MODE
-                    debugD("SK FORCE PUMP STATUS %d", forcePumpStatus);
-                #endif
+    //SignalK marche forcée
+    // Handler pour Signal K (PUT)
+    auto* signalKMarcheForce = new SKPutRequestListener<bool>("sensors.cuve_eaux_noires.pump.force_on_sk");
+    signalKMarcheForce->attach([signalKMarcheForce]() {
+        forcePumpStatus = signalKMarcheForce->get();
+        #ifdef DEBUG_MODE
+            debugD("SK FORCE PUMP STATUS %d", forcePumpStatus);
+        #endif
+        return true; 
     });
 
   //Web UI marche forcee
